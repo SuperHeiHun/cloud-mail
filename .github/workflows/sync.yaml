@@ -13,6 +13,11 @@ on:
         required: false
         default: false
         type: boolean
+      sync_tags:
+        description: "同步上游 tags（GITHUB_TOKEN 无 workflows 权限会被拒绝，需改用 PAT）"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -95,7 +100,15 @@ jobs:
       - name: Push
         env:
           BRANCH: ${{ inputs.branch }}
+          SYNC_TAGS: ${{ inputs.sync_tags }}
         run: |
           # 历史被重置过时必然 non-fast-forward，因此统一用 --force-with-lease（仅允许按本地已知的 origin 状态覆盖）
           git push origin "HEAD:${BRANCH}" --force-with-lease
-          git push origin --tags
+
+          # GITHUB_TOKEN 无法推送包含 workflow 文件变更的 tag（GitHub 会拒绝），默认不同步 tags；
+          # 勾选 sync_tags 时尽力推送，失败不阻塞工作流
+          if [ "${SYNC_TAGS}" = "true" ]; then
+            if ! git push origin --tags; then
+              echo "::notice::tags 同步被拒绝：GITHUB_TOKEN 无 workflows 权限，不能推送包含 workflow 变更的 tag。如需同步 tags，请在仓库配置含 workflow 权限的 PAT 并替换推送凭证。"
+            fi
+          fi
