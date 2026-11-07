@@ -1,0 +1,101 @@
+name: Sync Fork
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "要同步的分支"
+        required: true
+        default: "main"
+        type: string
+      force:
+        description: "强制同步（以上游为准重置 fork，仅保留 workflows）"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream & fetch
+        run: |
+          git remote add upstream https://github.com/maillab/cloud-mail.git
+          git fetch upstream --tags --prune
+
+      - name: Merge / snapshot upstream
+        env:
+          BRANCH: ${{ inputs.branch }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          UP="upstream/${BRANCH}"
+          if ! git rev-parse --verify --quiet "${UP}" >/dev/null; then
+            echo "::error::上游仓库不存在分支 ${UP}"
+            exit 1
+          fi
+
+          # 备份 fork 自己的 workflows（sync / deploy 等），同步后原样保留
+          KEEP_WORKFLOWS=0
+          if [ -d .github/workflows ]; then
+            rm -rf /tmp/fork-workflows
+            cp -r .github/workflows /tmp/fork-workflows
+            KEEP_WORKFLOWS=1
+          fi
+
+          # 本仓库与上游历史无关（上游导入/重建过），merge-base 为空时走快照式同步
+          BASE="$(git merge-base HEAD "${UP}" || true)"
+
+          if [ -n "${BASE}" ] && [ "${FORCE}" != "true" ]; then
+            echo "存在共同历史，常规合并…"
+            if ! git merge "${UP}" --no-edit; then
+              git merge --abort || true
+              echo "::error::合并冲突，请本地解决后重试，或勾选 force 强制同步"
+              exit 1
+            fi
+          else
+            if [ -z "${BASE}" ]; then
+              echo "fork 与上游没有共同历史，改用快照式同步（以上游 ${UP} 为准）"
+            else
+              echo "强制同步：重置到 ${UP}"
+            fi
+            git reset --hard "${UP}"
+
+            # 恢复 fork 自己的 Actions 配置，避免被上游覆盖导致 workflow 失效
+            if [ "${KEEP_WORKFLOWS}" = "1" ]; then
+              rm -rf .github/workflows
+              cp -r /tmp/fork-workflows .github/workflows
+              git add -A .github/workflows
+              if ! git diff --cached --quiet; then
+                git commit -m "chore: sync from upstream (keep fork workflows)"
+              fi
+            fi
+          fi
+
+      - name: Push
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          # 历史被重置过时必然 non-fast-forward，因此统一用 --force-with-lease（仅允许按本地已知的 origin 状态覆盖）
+          git push origin "HEAD:${BRANCH}" --force-with-lease
+          git push origin --tags
